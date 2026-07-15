@@ -30,12 +30,17 @@ class CacheDAO:
     @Reference: https://github.com/SocialSisterYi/xuexiaoyi-to-xuexitong-tampermonkey-proxy
     """
     DEFAULT_CACHE_FILE = "cache.json"
+    _locks = {}
+    _locks_guard = threading.Lock()
 
     def __init__(self, file: str = DEFAULT_CACHE_FILE):
         self.cache_file = Path(file)
-        self._lock = threading.RLock()
-        if not self.cache_file.is_file():
-            self._write_cache({})
+        cache_path = self.cache_file.resolve()
+        with self._locks_guard:
+            self._lock = self._locks.setdefault(cache_path, threading.RLock())
+        with self._lock:
+            if not self.cache_file.is_file():
+                self._write_cache({})
 
     def _read_cache(self) -> dict:
         # 新增缓存文件读取的异常处理
@@ -414,7 +419,7 @@ class TikuYanxi(Tiku):
             if not res_json['code']:
                 # 如果是因为TOKEN次数到期, 则更换token
                 if self._times == 0 or '次数不足' in res_json['data']['answer']:
-                    logger.info(f'TOKEN查询次数不足, 将会更换并重新搜题')
+                    logger.info('TOKEN查询次数不足, 将会更换并重新搜题')
                     self._token_index += 1
                     self.load_token()
                     # 重新查询
@@ -911,10 +916,19 @@ class TikuLike(Tiku):
 
     def load_config(self) -> None:
         # 从配置中获取参数，提供默认值
-        self._search = self._conf.get('likeapi_search', False)
+        def get_bool(name: str, default: bool) -> bool:
+            value = self._conf.get(name, default)
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in configparser.ConfigParser.BOOLEAN_STATES:
+                    return configparser.ConfigParser.BOOLEAN_STATES[normalized]
+                return default
+            return bool(value)
+
+        self._search = get_bool('likeapi_search', False)
         self._model = self._conf.get('likeapi_model', None)
-        self._vision = self._conf.get('likeapi_vision', True)
-        self._retry = self._conf.get("likeapi_retry", True)
+        self._vision = get_bool('likeapi_vision', True)
+        self._retry = get_bool("likeapi_retry", True)
         self._retry_times = int(self._conf.get("likeapi_retry_times", 3))
 
     def _init_tiku(self) -> None:
@@ -1096,7 +1110,7 @@ class AI(Tiku):
             response = json.loads(remove_md_json_wrapper(completion.choices[0].message.content))
             sep = "\n"
             return sep.join(response['Answer']).strip()
-        except:
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
             logger.error("无法解析大模型输出内容")
             return None
 
@@ -1131,10 +1145,19 @@ class AI(Tiku):
                         'content': '你好，请回答：1+1 等于几？只回答数字。'
                     }
                 ],
-                max_tokens=64
+                max_tokens=200
             ))
-            
-            if completion.choices and completion.choices[0].message.content:
+
+            choices = getattr(completion, 'choices', None) or []
+            message = getattr(choices[0], 'message', None) if choices else None
+            if isinstance(message, dict):
+                content = message.get('content')
+                reasoning_content = message.get('reasoning_content')
+            else:
+                content = getattr(message, 'content', None)
+                reasoning_content = getattr(message, 'reasoning_content', None)
+
+            if content or reasoning_content:
                 logger.info(f'{self.name} 连接检查成功')
                 return True
             else:
@@ -1258,7 +1281,7 @@ class SiliconFlow(Tiku):
                     }
                 ],
                 'stream': False,
-                'max_tokens': 10,
+                'max_tokens': 200,
                 'temperature': 0.7,
                 'top_p': 0.7,
                 'response_format': {'type': 'text'}
@@ -1273,7 +1296,12 @@ class SiliconFlow(Tiku):
             
             if response.status_code == 200:
                 result = response.json()
-                if result.get('choices') and result['choices'][0]['message']['content']:
+                choices = result.get('choices') if isinstance(result, dict) else None
+                first_choice = choices[0] if isinstance(choices, list) and choices else None
+                message = first_choice.get('message') if isinstance(first_choice, dict) else None
+                content = message.get('content') if isinstance(message, dict) else None
+                reasoning_content = message.get('reasoning_content') if isinstance(message, dict) else None
+                if content or reasoning_content:
                     logger.info(f'{self.name} 连接检查成功')
                     return True
                 else:
